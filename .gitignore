@@ -1,0 +1,34 @@
+# Arduino build artifacts
+*.elf
+*.hex
+*.bin
+*.map
+*.eep
+*.lst
+*.o
+
+# Arduino IDE temporary files
+**/.arduinoIDE/
+**/build/
+**/build-*/
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Logs and local notes
+*.log
+*.tmp
+
+# Python caches if helper scripts are added later
+__pycache__/
+*.pyc
+
+# Secrets/local configuration
+.env
+*.local
+
+# Generated release archives
+*.zip
