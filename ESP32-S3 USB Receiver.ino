@@ -2,552 +2,213 @@
 #include <WiFi.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
-
 #include "USB.h"
 #include "USBHIDMouse.h"
 #include "USBHIDKeyboard.h"
 
-// ============================================================
-// ESP32-S3 RECEIVER
-// ============================================================
+// ========================= GRAVIX ZYRO BY AIRNEX =========================
+// Receiver: ESP32-S3-32E N16R8; native USB HID to Windows 11.
+// Packet layout/version must match Gravix_Zyro_Controller.ino.
 
-#define ESPNOW_CHANNEL 1
-
+constexpr uint8_t ESPNOW_CHANNEL=1;
+constexpr uint16_t PACKET_MAGIC=0xC0DE;
+constexpr uint8_t PACKET_VERSION=3;
+constexpr uint8_t MODE_TOUCHPAD=0, MODE_JOYSTICK=1, MODE_AIR_MOUSE=2;
 USBHIDMouse Mouse;
 USBHIDKeyboard Keyboard;
 
-// ------------------------------------------------------------
-// MUST MATCH TRANSMITTER PACKET
-// ------------------------------------------------------------
-
 struct ControllerPacket {
   uint16_t magic;
-  uint8_t  version;
-  uint8_t  mode;
-  uint8_t  buttons;
-  uint8_t  gesture;
-  uint32_t seq;
-
-  int16_t  joy_x;
-  int16_t  joy_y;
-
-  uint16_t touch_x;
-  uint16_t touch_y;
-
-  int16_t  gyro_x;
-  int16_t  gyro_y;
-  int16_t  gyro_z;
-
-  int16_t  accel_x;
-  int16_t  accel_y;
-  int16_t  accel_z;
-
-  uint32_t uptime_ms;
+  uint8_t version;
+  uint8_t mode;
+  uint8_t buttons;
+  uint8_t touchActive;
+  uint8_t gesture;
+  uint16_t touchX;
+  uint16_t touchY;
+  int16_t joyX;
+  int16_t joyY;
+  int16_t gyroX;
+  int16_t gyroY;
+  int16_t gyroZ;
+  uint32_t sequence;
 };
+static_assert(sizeof(ControllerPacket)<=250,"Packet exceeds ESP-NOW limit");
 
-static_assert(sizeof(ControllerPacket) <= 250,
-              "Packet too large for ESP-NOW");
+portMUX_TYPE rxMux=portMUX_INITIALIZER_UNLOCKED;
+ControllerPacket latestPacket={};
+volatile bool packetPending=false;
+volatile uint32_t lastRxMs=0, packetCount=0;
+uint32_t lastSequence=0,lastDebugMs=0,previousInputMs=0;
+bool havePacket=false,disconnected=true;
+uint8_t mode=MODE_TOUCHPAD,previousButtons=0;
 
-// ------------------------------------------------------------
-// RECEIVED DATA
-// ------------------------------------------------------------
+constexpr float JOY_SPEED=5.0f;
+constexpr float AIR_GAIN=240.0f, AIR_DEADZONE=0.035f, AIR_FILTER=0.30f;
+constexpr float TOUCH_GAIN=1.25f;
+constexpr int TOUCH_JUMP_LIMIT=55;
+constexpr int TAP_MOVE_LIMIT=8;
+constexpr uint32_t TAP_MAX_MS=260;
+constexpr uint32_t CLICK_DEBOUNCE_MS=28;
 
-volatile bool newPacket = false;
-volatile uint32_t packetCount = 0;
-volatile uint32_t lastPacketMillis = 0;
+float airX=0,airY=0,fractionalX=0,fractionalY=0;
+bool touchWasActive=false,touchMoved=false;
+uint16_t prevTouchX=0,prevTouchY=0,touchStartX=0,touchStartY=0;
+uint32_t touchStartMs=0;
+uint32_t lastLeftEdgeMs=0,lastRightEdgeMs=0;
+bool leftStable=false,rightStable=false;
+uint8_t leftCandidate=0,rightCandidate=0;
+uint32_t leftCandidateMs=0,rightCandidateMs=0;
 
-ControllerPacket rxPacket;
-
-portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
-
-// ------------------------------------------------------------
-// STATE
-// ------------------------------------------------------------
-
-uint8_t previousButtons = 0;
-uint8_t currentMode = 0;
-uint32_t lastSequence = 0;
-
-float remainderX = 0;
-float remainderY = 0;
-
-// ============================================================
-// ESP-NOW RECEIVE CALLBACK
-// ============================================================
-
-void onDataReceive(
-  const esp_now_recv_info_t *info,
-  const uint8_t *data,
-  int len
-) {
+void onDataReceive(const esp_now_recv_info_t *info,const uint8_t *data,int len) {
   (void)info;
-
-  if (len != sizeof(ControllerPacket)) {
-    return;
-  }
-
-  ControllerPacket temp;
-
-  memcpy(&temp, data, sizeof(temp));
-
-  // Check packet signature
-  if (temp.magic != 0xC0DE) {
-    return;
-  }
-
-  if (temp.version != 1) {
-    return;
-  }
-
-  portENTER_CRITICAL_ISR(&mux);
-
-  rxPacket = temp;
-  newPacket = true;
-  packetCount++;
-  lastPacketMillis = millis();
-
-  portEXIT_CRITICAL_ISR(&mux);
+  if (len!=(int)sizeof(ControllerPacket)) return;
+  ControllerPacket p; memcpy(&p,data,sizeof(p));
+  if (p.magic!=PACKET_MAGIC || p.version!=PACKET_VERSION || p.mode>MODE_AIR_MOUSE) return;
+  portENTER_CRITICAL(&rxMux);
+  latestPacket=p; packetPending=true; lastRxMs=millis(); packetCount++;
+  portEXIT_CRITICAL(&rxMux);
 }
-
-// ============================================================
-// START ESP-NOW
-// ============================================================
-
-bool startESPNow() {
-
-  WiFi.mode(WIFI_STA);
-  WiFi.disconnect();
-
-  delay(100);
-
-  Serial.print("Receiver MAC: ");
-  Serial.println(WiFi.macAddress());
-
-  if (esp_wifi_set_channel(
-        ESPNOW_CHANNEL,
-        WIFI_SECOND_CHAN_NONE) != ESP_OK) {
-
-    Serial.println("ERROR: WiFi channel setup failed");
-    return false;
-  }
-
-  if (esp_now_init() != ESP_OK) {
-
-    Serial.println("ERROR: ESP-NOW init failed");
-    return false;
-  }
-
-  esp_now_register_recv_cb(onDataReceive);
-
-  Serial.println("ESP-NOW receiver ready");
-
-  return true;
+bool startRadio() {
+  WiFi.mode(WIFI_STA); WiFi.disconnect(); delay(100);
+  if (esp_wifi_set_channel(ESPNOW_CHANNEL,WIFI_SECOND_CHAN_NONE)!=ESP_OK) return false;
+  if (esp_now_init()!=ESP_OK) return false;
+  return esp_now_register_recv_cb(onDataReceive)==ESP_OK;
 }
-
-// ============================================================
-// RELEASE HID
-// ============================================================
-
-void releaseAllHID() {
-
-  Mouse.release(MOUSE_LEFT);
-  Mouse.release(MOUSE_RIGHT);
-  Mouse.release(MOUSE_MIDDLE);
-  Mouse.release(MOUSE_BACKWARD);
-  Mouse.release(MOUSE_FORWARD);
-
+void releaseAllInputs() {
+  Mouse.release(MOUSE_LEFT); Mouse.release(MOUSE_RIGHT); Mouse.release(MOUSE_MIDDLE);
   Keyboard.releaseAll();
-
-  previousButtons = 0;
+  previousButtons=0; touchWasActive=false; touchMoved=false;
+  airX=airY=fractionalX=fractionalY=0;
+  leftStable=rightStable=false; leftCandidate=rightCandidate=0;
 }
-
-// ============================================================
-// MOUSE BUTTONS
-// ============================================================
-
-void processMouseButtons(uint8_t buttons) {
-
-  uint8_t changed =
-    buttons ^ previousButtons;
-
-  // B1 = LEFT
-  if (changed & (1 << 0)) {
-
-    if (buttons & (1 << 0))
-      Mouse.press(MOUSE_LEFT);
-    else
-      Mouse.release(MOUSE_LEFT);
-  }
-
-  // B2 = RIGHT
-  if (changed & (1 << 1)) {
-
-    if (buttons & (1 << 1))
-      Mouse.press(MOUSE_RIGHT);
-    else
-      Mouse.release(MOUSE_RIGHT);
-  }
-
-  // B4 = BACK
-  if (changed & (1 << 3)) {
-
-    if (buttons & (1 << 3))
-      Mouse.press(MOUSE_BACKWARD);
-    else
-      Mouse.release(MOUSE_BACKWARD);
-  }
-
-  // B5 = FORWARD
-  if (changed & (1 << 4)) {
-
-    if (buttons & (1 << 4))
-      Mouse.press(MOUSE_FORWARD);
-    else
-      Mouse.release(MOUSE_FORWARD);
-  }
-
-  // Joystick button = MIDDLE
-  if (changed & (1 << 5)) {
-
-    if (buttons & (1 << 5))
-      Mouse.press(MOUSE_MIDDLE);
-    else
-      Mouse.release(MOUSE_MIDDLE);
-  }
-
-  previousButtons = buttons;
+void moveMouseSmooth(float dx,float dy) {
+  fractionalX+=dx; fractionalY+=dy;
+  int mx=(int)fractionalX,my=(int)fractionalY;
+  fractionalX-=mx; fractionalY-=my;
+  mx=constrain(mx,-127,127); my=constrain(my,-127,127);
+  if (mx||my) Mouse.move((int8_t)mx,(int8_t)my);
 }
-
-// ============================================================
-// KEYBOARD BUTTONS
-// ============================================================
-
-void processKeyboardButtons(uint8_t buttons) {
-
-  uint8_t changed =
-    buttons ^ previousButtons;
-
-  // B1 = ENTER
-  if (changed & (1 << 0)) {
-
-    if (buttons & (1 << 0))
-      Keyboard.press(KEY_RETURN);
-    else
-      Keyboard.release(KEY_RETURN);
-  }
-
-  // B2 = ESC
-  if (changed & (1 << 1)) {
-
-    if (buttons & (1 << 1))
-      Keyboard.press(KEY_ESC);
-    else
-      Keyboard.release(KEY_ESC);
-  }
-
-  // B4 = LEFT
-  if (changed & (1 << 3)) {
-
-    if (buttons & (1 << 3))
-      Keyboard.press(KEY_LEFT_ARROW);
-    else
-      Keyboard.release(KEY_LEFT_ARROW);
-  }
-
-  // B5 = RIGHT
-  if (changed & (1 << 4)) {
-
-    if (buttons & (1 << 4))
-      Keyboard.press(KEY_RIGHT_ARROW);
-    else
-      Keyboard.release(KEY_RIGHT_ARROW);
-  }
-
-  // Joystick button = SPACE
-  if (changed & (1 << 5)) {
-
-    if (buttons & (1 << 5))
-      Keyboard.press(KEY_SPACE);
-    else
-      Keyboard.release(KEY_SPACE);
-  }
-
-  previousButtons = buttons;
+bool debounced(bool raw,uint8_t &candidate,uint32_t &candidateMs,bool &stable,uint32_t now) {
+  uint8_t v=raw?1:0;
+  if (v!=candidate) { candidate=v; candidateMs=now; }
+  if (v!=stable && now-candidateMs>=CLICK_DEBOUNCE_MS) stable=v;
+  return stable;
 }
-
-// ============================================================
-// JOYSTICK → MOUSE
-// ============================================================
-
-void processMouseMovement(
-  const ControllerPacket &p
-) {
-
-  float x =
-    (float)p.joy_x / 1000.0f;
-
-  float y =
-    (float)p.joy_y / 1000.0f;
-
-  float moveX = x * 7.0f;
-  float moveY = y * 7.0f;
-
-  // Small gyro contribution
-  float gx =
-    (float)p.gyro_x / 1000.0f;
-
-  float gy =
-    (float)p.gyro_y / 1000.0f;
-
-  if (fabs(gy) > 0.08f)
-    moveX += gy * 1.5f;
-
-  if (fabs(gx) > 0.08f)
-    moveY -= gx * 1.5f;
-
-  remainderX += moveX;
-  remainderY += moveY;
-
-  int mx = (int)remainderX;
-  int my = (int)remainderY;
-
-  remainderX -= mx;
-  remainderY -= my;
-
-  mx = constrain(mx, -127, 127);
-  my = constrain(my, -127, 127);
-
-  if (mx != 0 || my != 0) {
-
-    Mouse.move(
-      (int8_t)mx,
-      (int8_t)my
-    );
+void processMouseButtons(uint8_t buttons,uint32_t now) {
+  bool rawLeft=(buttons&(1<<0))!=0; // Only the dedicated physical left button.
+  bool rawRight=(buttons&(1<<1))!=0;
+  bool left=debounced(rawLeft,leftCandidate,leftCandidateMs,leftStable,now);
+  bool right=debounced(rawRight,rightCandidate,rightCandidateMs,rightStable,now);
+  static bool sentLeft=false,sentRight=false;
+  if (left!=sentLeft) { if(left) Mouse.press(MOUSE_LEFT); else Mouse.release(MOUSE_LEFT); sentLeft=left; }
+  if (right!=sentRight) { if(right) Mouse.press(MOUSE_RIGHT); else Mouse.release(MOUSE_RIGHT); sentRight=right; }
+  bool backNow=(buttons&(1<<3))!=0;
+  bool backBefore=(previousButtons&(1<<3))!=0;
+  if(backNow&&!backBefore) {
+    Keyboard.press(KEY_LEFT_ALT); Keyboard.press(KEY_LEFT_ARROW);
+  } else if(!backNow&&backBefore) {
+    Keyboard.release(KEY_LEFT_ARROW); Keyboard.release(KEY_LEFT_ALT);
   }
+  previousButtons=buttons;
 }
-
-// ============================================================
-// TOUCH GESTURES
-// ============================================================
-
-void processGesture(uint8_t gesture) {
-
-  switch (gesture) {
-
-    // Single tap
-    case 0x05:
-      Mouse.click(MOUSE_LEFT);
-      Serial.println("GESTURE: TAP");
-      break;
-
-    // Double tap
-    case 0x0B:
-      Mouse.click(MOUSE_LEFT);
-      delay(40);
-      Mouse.click(MOUSE_LEFT);
-      Serial.println("GESTURE: DOUBLE TAP");
-      break;
-
-    // Long press
-    case 0x0C:
-      Mouse.click(MOUSE_RIGHT);
-      Serial.println("GESTURE: LONG PRESS");
-      break;
-
-    // Swipe left
-    case 0x03:
-      Mouse.click(MOUSE_BACKWARD);
-      Serial.println("GESTURE: LEFT");
-      break;
-
-    // Swipe right
-    case 0x04:
-      Mouse.click(MOUSE_FORWARD);
-      Serial.println("GESTURE: RIGHT");
-      break;
-
-    // Swipe up
-    case 0x01:
-      Keyboard.write(KEY_PAGE_UP);
-      Serial.println("GESTURE: UP");
-      break;
-
-    // Swipe down
-    case 0x02:
-      Keyboard.write(KEY_PAGE_DOWN);
-      Serial.println("GESTURE: DOWN");
-      break;
-
-    default:
-      break;
-  }
-}
-
-// ============================================================
-// SETUP
-// ============================================================
-
-void setup() {
-
-  Serial.begin(115200);
-
-  delay(1000);
-
-  Serial.println();
-  Serial.println();
-  Serial.println("================================");
-  Serial.println(" ESP32-S3 USB HID RECEIVER");
-  Serial.println("================================");
-
-  // Start USB HID
-  Mouse.begin();
-  Keyboard.begin();
-  USB.begin();
-
-  Serial.println("USB HID started");
-
-  // Start ESP-NOW
-  if (!startESPNow()) {
-
-    Serial.println(
-      "ESP-NOW START FAILED"
-    );
-
-  } else {
-
-    Serial.println(
-      "ESP-NOW STARTED"
-    );
-  }
-
-  Serial.println();
-  Serial.println(
-    "Waiting for controller packets..."
-  );
-}
-
-// ============================================================
-// LOOP
-// ============================================================
-
-void loop() {
-
-  ControllerPacket packet;
-  bool received = false;
-
-  // Safely copy latest packet
-  portENTER_CRITICAL(&mux);
-
-  if (newPacket) {
-
-    packet = rxPacket;
-    newPacket = false;
-    received = true;
-  }
-
-  uint32_t count = packetCount;
-  uint32_t age =
-    millis() - lastPacketMillis;
-
-  portEXIT_CRITICAL(&mux);
-
-  // ----------------------------------------------------------
-  // PROCESS PACKET
-  // ----------------------------------------------------------
-
-  if (received) {
-
-    if (packet.seq != lastSequence) {
-
-      lastSequence = packet.seq;
-
-      // Mode changed
-      if (packet.mode != currentMode) {
-
-        releaseAllHID();
-
-        currentMode =
-          packet.mode;
-
-        Serial.print("MODE: ");
-
-        Serial.println(
-          currentMode == 0
-            ? "MOUSE"
-            : "KEYBOARD"
-        );
-      }
-
-      // Mouse mode
-      if (currentMode == 0) {
-
-        processMouseButtons(
-          packet.buttons
-        );
-
-        processMouseMovement(
-          packet
-        );
-
-      }
-
-      // Keyboard mode
-      else {
-
-        processKeyboardButtons(
-          packet.buttons
-        );
-      }
-
-      // Touch
-      if (packet.gesture != 0) {
-
-        processGesture(
-          packet.gesture
-        );
-      }
+void processTouchpad(const ControllerPacket &p,uint32_t now) {
+  bool active=p.touchActive!=0;
+  if(active&&!touchWasActive) {
+    touchStartX=prevTouchX=p.touchX; touchStartY=prevTouchY=p.touchY;
+    touchStartMs=now; touchMoved=false;
+  } else if(active&&touchWasActive) {
+    int dx=(int)p.touchX-(int)prevTouchX;
+    int dy=(int)p.touchY-(int)prevTouchY;
+    if(abs(dx)<=TOUCH_JUMP_LIMIT&&abs(dy)<=TOUCH_JUMP_LIMIT) {
+      if(abs((int)p.touchX-(int)touchStartX)>TAP_MOVE_LIMIT ||
+         abs((int)p.touchY-(int)touchStartY)>TAP_MOVE_LIMIT) touchMoved=true;
+      moveMouseSmooth(dx*TOUCH_GAIN,dy*TOUCH_GAIN);
     }
+    prevTouchX=p.touchX; prevTouchY=p.touchY;
+  } else if(!active&&touchWasActive) {
+    if(!touchMoved && now-touchStartMs<TAP_MAX_MS) Mouse.click(MOUSE_LEFT);
   }
-
-  // ----------------------------------------------------------
-  // SAFETY TIMEOUT
-  // ----------------------------------------------------------
-
-  if (age > 500) {
-
-    releaseAllHID();
-
-    remainderX = 0;
-    remainderY = 0;
+  touchWasActive=active;
+}
+void processJoystick(const ControllerPacket &p) {
+  float x=p.joyX/1000.0f,y=p.joyY/1000.0f;
+  // Squared curve gives fine control near center. No click is generated by
+  // joystick motion; joystick switch is intentionally ignored in controller.
+  x=copysignf(x*x,x); y=copysignf(y*y,y);
+  moveMouseSmooth(x*JOY_SPEED,y*JOY_SPEED);
+}
+void processAirMouse(const ControllerPacket &p,float dt) {
+  float gx=p.gyroX/1000.0f,gy=p.gyroY/1000.0f;
+  if(fabsf(gx)<AIR_DEADZONE)gx=0;
+  if(fabsf(gy)<AIR_DEADZONE)gy=0;
+  airX+=AIR_FILTER*(gx-airX); airY+=AIR_FILTER*(gy-airY);
+  moveMouseSmooth(airY*AIR_GAIN*dt,-airX*AIR_GAIN*dt);
+}
+void pressShortcut(uint8_t key,bool gui=false,bool alt=false) {
+  if(gui) Keyboard.press(KEY_LEFT_GUI);
+  if(alt) Keyboard.press(KEY_LEFT_ALT);
+  Keyboard.press(key); delay(12); Keyboard.releaseAll();
+}
+void processGesture(uint8_t g) {
+  // CST816D gesture register values vary by controller firmware/module.
+  // Verify observed codes on your exact panel before relying on these mappings.
+  switch(g) {
+    case 0x01: pressShortcut(KEY_TAB,true,false); break;       // Task View
+    case 0x02: Keyboard.press(KEY_LEFT_GUI); Keyboard.press('d'); delay(12); Keyboard.releaseAll(); break;
+    case 0x03: pressShortcut(KEY_LEFT_ARROW,false,true); break;
+    case 0x04: pressShortcut(KEY_RIGHT_ARROW,false,true); break;
+    case 0x0B: Mouse.click(MOUSE_LEFT); break;
+    case 0x0C: Mouse.click(MOUSE_RIGHT); break;
+    default: break;
   }
-
-  // ----------------------------------------------------------
-  // STATUS
-  // ----------------------------------------------------------
-
-  static uint32_t lastStatus = 0;
-
-  if (millis() - lastStatus >= 1000) {
-
-    lastStatus = millis();
-
-    Serial.print("Packets: ");
-    Serial.print(count);
-
-    Serial.print(" | Age: ");
-    Serial.print(age);
-
-    Serial.print(" ms | Sequence: ");
-    Serial.print(lastSequence);
-
-    Serial.print(" | Mode: ");
-
-    Serial.println(
-      currentMode == 0
-        ? "MOUSE"
-        : "KEYBOARD"
-    );
+}
+void setup() {
+  Serial.begin(115200); delay(500);
+  Serial.println("\nGravix Zyro by AirNex receiver starting");
+  Mouse.begin(); Keyboard.begin(); USB.begin();
+  Serial.println("USB HID initialized");
+  if(startRadio()) Serial.println("ESP-NOW ready; waiting for controller");
+  else Serial.println("ERROR: ESP-NOW startup failed");
+}
+void loop() {
+  uint32_t now=millis();
+  ControllerPacket p={}; bool gotPacket=false;
+  uint32_t rxTime,totalPackets;
+  portENTER_CRITICAL(&rxMux);
+  if(packetPending) { p=latestPacket; packetPending=false; gotPacket=true; }
+  rxTime=lastRxMs; totalPackets=packetCount;
+  portEXIT_CRITICAL(&rxMux);
+  uint32_t age=(rxTime==0)?UINT32_MAX:now-rxTime;
+  if(age>350) {
+    if(!disconnected) { Serial.println("Controller timeout; releasing HID inputs"); releaseAllInputs(); disconnected=true; }
+    delay(1); return;
   }
-
+  if(!gotPacket||p.sequence==lastSequence) { delay(1); return; }
+  lastSequence=p.sequence; disconnected=false;
+  if(!havePacket) { havePacket=true; mode=p.mode; previousButtons=p.buttons; previousInputMs=now; delay(1); return; }
+  if(p.mode!=mode) {
+    releaseAllInputs(); mode=p.mode; previousButtons=p.buttons; previousInputMs=now;
+    Serial.printf("Mode changed to %u\n",mode); delay(1); return;
+  }
+  float dt=(now-previousInputMs)/1000.0f; previousInputMs=now;
+  dt=constrain(dt,0.001f,0.030f);
+  if(mode==MODE_TOUCHPAD) {
+    processMouseButtons(p.buttons,now);
+    processTouchpad(p,now);
+  } else if(mode==MODE_JOYSTICK) {
+    processMouseButtons(p.buttons,now);
+    processJoystick(p);
+  } else if(mode==MODE_AIR_MOUSE) {
+    processMouseButtons(p.buttons,now);
+    processAirMouse(p,dt);
+  }
+  if(p.gesture!=0 && mode==MODE_TOUCHPAD) processGesture(p.gesture);
+  if(now-lastDebugMs>=1000) {
+    lastDebugMs=now;
+    Serial.printf("RX=%lu age=%lu mode=%u seq=%lu gyro=%d,%d,%d\n",
+      (unsigned long)totalPackets,(unsigned long)age,mode,
+      (unsigned long)lastSequence,p.gyroX,p.gyroY,p.gyroZ);
+  }
   delay(1);
 }
