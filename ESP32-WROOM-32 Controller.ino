@@ -1,227 +1,302 @@
+#include <Arduino.h>
+#include <Wire.h>
 #include <WiFi.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
+#include <math.h>
+#include <Arduino_GFX_Library.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
 
-// ---------------- PIN CONFIGURATION ----------------
-#define BUTTON_B1 13
-#define BUTTON_B2 14
-#define BUTTON_B3 25
-#define BUTTON_B4 26
+// ========================= GRAVIX ZYRO BY AIRNEX =========================
+// Controller: ESP32-WROOM-32
+// IMU is read directly over I2C because this module reports WHO_AM_I=0x70.
+// Keep this packet structure synchronized with Gravix_Zyro_Receiver.ino.
 
-#define JOYSTICK_X 34
-#define JOYSTICK_Y 35
+constexpr int SDA_PIN = 21, SCL_PIN = 22;
+constexpr int LCD_SCLK = 18, LCD_MISO = 19, LCD_MOSI = 23;
+constexpr int LCD_CS = 5, LCD_DC = 27, LCD_RST = 33;
+constexpr int LCD_BL = 17; // Change if your backlight is wired elsewhere.
+constexpr int TOUCH_INT = 34, TOUCH_RST = 32;
+constexpr int JOY_X = 36, JOY_Y = 39, JOY_SW = 35;
+constexpr int BTN_LEFT = 13;
+constexpr int BTN_RIGHT = 14;
+constexpr int BTN_MODE = 25;
+constexpr int BTN_BACK = 26;
 
-// Replace this with the MAC address printed by the ESP32-S3 receiver.
-uint8_t receiverMAC[] = {
-  0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF
-};
+constexpr uint8_t TOUCH_ADDR = 0x15;
+constexpr uint8_t IMU_ADDR = 0x68;
+constexpr uint8_t ESPNOW_CHANNEL = 1;
 
-// ---------------- MODES ----------------
-enum ControlMode : uint8_t {
-  MOUSE_MODE = 0,
-  KEYBOARD_MODE = 1
-};
+constexpr uint8_t MODE_TOUCHPAD = 0;
+constexpr uint8_t MODE_JOYSTICK = 1;
+constexpr uint8_t MODE_AIR_MOUSE = 2;
 
-ControlMode currentMode = MOUSE_MODE;
+const uint8_t BROADCAST_MAC[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
 
-// ---------------- PACKET FORMAT ----------------
-// Keep this structure identical on both boards.
-typedef struct __attribute__((packed)) {
+struct ControllerPacket {
+  uint16_t magic;
+  uint8_t version;
   uint8_t mode;
-  int8_t dx;
-  int8_t dy;
-  uint8_t events;
-  uint16_t sequence;
-} FrameMindPacket;
+  uint8_t buttons;
+  uint8_t touchActive;
+  uint8_t gesture;
+  uint16_t touchX;
+  uint16_t touchY;
+  int16_t joyX;
+  int16_t joyY;
+  int16_t gyroX;
+  int16_t gyroY;
+  int16_t gyroZ;
+  uint32_t sequence;
+};
+static_assert(sizeof(ControllerPacket) <= 250, "Packet exceeds ESP-NOW limit");
 
-FrameMindPacket packet;
-uint16_t sequenceNumber = 0;
+Arduino_DataBus *lcdBus = new Arduino_ESP32SPI(
+  LCD_DC, LCD_CS, LCD_SCLK, LCD_MOSI, LCD_MISO, VSPI
+);
+Arduino_GFX *lcd = new Arduino_ST7789(lcdBus, LCD_RST, 0, true, 240, 320);
+Adafruit_SSD1306 oled(128, 64, &Wire, -1);
 
-// Event bits: sent only when a button is pressed.
-#define EVENT_B1 0x01
-#define EVENT_B2 0x02
-#define EVENT_B4 0x04
+bool lcdReady=false, oledReady=false, imuReady=false, radioReady=false;
+uint8_t mode=MODE_TOUCHPAD, previousButtons=0, lastGesture=0;
+uint16_t touchX=0, touchY=0;
+bool touchActive=false;
+int joyCenterX=2048, joyCenterY=2048;
+float gyroBiasX=0, gyroBiasY=0, gyroBiasZ=0;
+uint32_t sequenceNo=0, lastSendUs=0, lastDisplayMs=0, lastDebugMs=0;
+uint8_t imuWhoAmI=0;
 
-const int JOYSTICK_CENTER = 2048;
-const int JOYSTICK_DEADZONE = 350;
-const int MAX_CURSOR_STEP = 8;
-
-bool previousB1 = HIGH;
-bool previousB2 = HIGH;
-bool previousB3 = HIGH;
-bool previousB4 = HIGH;
-
-uint32_t lastDebounceB1 = 0;
-uint32_t lastDebounceB2 = 0;
-uint32_t lastDebounceB3 = 0;
-uint32_t lastDebounceB4 = 0;
-
-const uint32_t DEBOUNCE_MS = 35;
-
-bool stablePressed(uint8_t pin, bool &previousReading,
-                   uint32_t &lastChange, bool &pressedEvent) {
-  bool reading = digitalRead(pin);
-  uint32_t now = millis();
-
-  if (reading != previousReading) {
-    previousReading = reading;
-    lastChange = now;
+// ------------------------- IMU low-level access -------------------------
+bool readImuReg(uint8_t reg, uint8_t &value) {
+  Wire.beginTransmission(IMU_ADDR);
+  Wire.write(reg);
+  if (Wire.endTransmission(false) != 0) return false;
+  if (Wire.requestFrom(IMU_ADDR, (uint8_t)1) != 1) return false;
+  value = Wire.read();
+  return true;
+}
+bool writeImuReg(uint8_t reg, uint8_t value) {
+  Wire.beginTransmission(IMU_ADDR);
+  Wire.write(reg); Wire.write(value);
+  return Wire.endTransmission() == 0;
+}
+bool readImuBurst(uint8_t startReg, uint8_t *buf, size_t count) {
+  Wire.beginTransmission(IMU_ADDR);
+  Wire.write(startReg);
+  if (Wire.endTransmission(false) != 0) return false;
+  size_t got = Wire.requestFrom(IMU_ADDR, (uint8_t)count);
+  if (got != count) {
+    while (Wire.available()) Wire.read();
+    return false;
   }
-
-  // Detect a stable press (HIGH -> LOW with INPUT_PULLUP).
-  static bool stableState[40];
-  static bool initialized[40];
-
-  if (!initialized[pin]) {
-    stableState[pin] = reading;
-    initialized[pin] = true;
-  }
-
-  if (now - lastChange >= DEBOUNCE_MS &&
-      reading != stableState[pin]) {
-    stableState[pin] = reading;
-
-    if (reading == LOW) {
-      pressedEvent = true;
+  for (size_t i=0; i<count; i++) buf[i] = Wire.read();
+  return true;
+}
+int16_t be16(const uint8_t *p) {
+  return (int16_t)((uint16_t(p[0]) << 8) | p[1]);
+}
+bool readGyroRad(float &gx, float &gy, float &gz) {
+  uint8_t d[14];
+  if (!readImuBurst(0x3B, d, sizeof(d))) return false;
+  // Layout compatible with MPU6050/MPU6500-family registers:
+  // accel X/Y/Z, temperature, gyro X/Y/Z.
+  const int16_t rawX=be16(&d[8]), rawY=be16(&d[10]), rawZ=be16(&d[12]);
+  // Gyro full-scale is configured to +/-500 degrees/sec (65.5 LSB/deg/s).
+  constexpr float RAW_TO_RAD_S = 0.017453292519943295f / 65.5f;
+  gx = rawX * RAW_TO_RAD_S - gyroBiasX;
+  gy = rawY * RAW_TO_RAD_S - gyroBiasY;
+  gz = rawZ * RAW_TO_RAD_S - gyroBiasZ;
+  return true;
+}
+void calibrateGyroscope() {
+  Serial.println("Keep Gravix Zyro still: calibrating gyro...");
+  delay(700);
+  double sx=0, sy=0, sz=0;
+  int valid=0;
+  for (int i=0; i<250; i++) {
+    uint8_t d[14];
+    if (readImuBurst(0x3B, d, sizeof(d))) {
+      constexpr float k=0.017453292519943295f / 65.5f;
+      sx += be16(&d[8])*k;
+      sy += be16(&d[10])*k;
+      sz += be16(&d[12])*k;
+      valid++;
     }
+    delay(4);
   }
-
-  return stableState[pin] == LOW;
+  if (valid > 0) {
+    gyroBiasX=sx/valid; gyroBiasY=sy/valid; gyroBiasZ=sz/valid;
+  }
+  Serial.printf("Gyro calibration samples=%d bias=%.4f,%.4f,%.4f rad/s\n",
+                valid, gyroBiasX, gyroBiasY, gyroBiasZ);
 }
-
-int8_t joystickAxis(int rawValue, bool invertAxis = false) {
-  int offset = rawValue - JOYSTICK_CENTER;
-
-  if (abs(offset) < JOYSTICK_DEADZONE) {
-    return 0;
+void initImu() {
+  if (!readImuReg(0x75, imuWhoAmI)) {
+    Serial.println("IMU not responding at 0x68");
+    return;
   }
-
-  int adjusted = offset;
-
-  if (adjusted > 0) {
-    adjusted -= JOYSTICK_DEADZONE;
-  } else {
-    adjusted += JOYSTICK_DEADZONE;
+  Serial.printf("IMU WHO_AM_I=0x%02X; using compatible raw register read\n", imuWhoAmI);
+  // Reset and wake device; wait for startup.
+  writeImuReg(0x6B, 0x80);
+  delay(100);
+  if (!writeImuReg(0x6B, 0x01)) {
+    Serial.println("IMU wake/config failed"); return;
   }
-
-  int value = map(
-    constrain(adjusted, -2048, 2047),
-    -2048, 2047,
-    -MAX_CURSOR_STEP, MAX_CURSOR_STEP
-  );
-
-  if (invertAxis) {
-    value = -value;
-  }
-
-  return (int8_t)constrain(value, -MAX_CURSOR_STEP, MAX_CURSOR_STEP);
+  delay(20);
+  // DLPF ~21 Hz; gyro +/-500 dps; accelerometer +/-4 g.
+  writeImuReg(0x1A, 0x04);
+  writeImuReg(0x1B, 0x08);
+  writeImuReg(0x1C, 0x08);
+  delay(20);
+  uint8_t test[14];
+  imuReady=readImuBurst(0x3B, test, sizeof(test));
+  Serial.println(imuReady ? "IMU raw data ready" : "IMU raw read failed");
 }
-
-void sendPacket() {
-  packet.sequence = sequenceNumber++;
-
-  esp_err_t result = esp_now_send(
-    receiverMAC,
-    (uint8_t *)&packet,
-    sizeof(packet)
-  );
-
-  if (result != ESP_OK) {
-    Serial.printf("ESP-NOW send error: %d\n", result);
+bool readTouch(uint8_t &gestureOut) {
+  Wire.beginTransmission(TOUCH_ADDR);
+  Wire.write(0x01);
+  if (Wire.endTransmission(false) != 0) return false;
+  if (Wire.requestFrom(TOUCH_ADDR, (uint8_t)6) != 6) {
+    while (Wire.available()) Wire.read();
+    return false;
+  }
+  uint8_t d[6]; for (int i=0;i<6;i++) d[i]=Wire.read();
+  gestureOut=d[0];
+  uint8_t fingers=d[1]&0x0F;
+  uint16_t rawX=((d[2]&0x0F)<<8)|d[3];
+  uint16_t rawY=((d[4]&0x0F)<<8)|d[5];
+  touchActive=fingers>0;
+  if (touchActive) {
+    // Starting landscape transform; adjust if axes/direction are reversed.
+    touchX=constrain(rawY,0,319);
+    touchY=239-constrain(rawX,0,239);
+  }
+  return true;
+}
+uint8_t readButtons() {
+  uint8_t b=0;
+  if (digitalRead(BTN_LEFT)==LOW) b|=1<<0;
+  if (digitalRead(BTN_RIGHT)==LOW) b|=1<<1;
+  if (digitalRead(BTN_MODE)==LOW) b|=1<<2;
+  if (digitalRead(BTN_BACK)==LOW) b|=1<<3;
+  // Deliberately ignore JOY_SW: GPIO35 has no internal pull-up and a floating
+  // switch can appear permanently pressed, causing accidental text selection.
+  // Re-enable only after adding an external 10k pull-up to 3.3V.
+  return b;
+}
+int16_t normalizeAxis(int raw, int center) {
+  int delta=raw-center;
+  constexpr int deadZone=180;
+  if (abs(delta)<=deadZone) return 0;
+  delta = delta>0 ? delta-deadZone : delta+deadZone;
+  float n=(float)delta/(2048.0f-deadZone);
+  n=constrain(n,-1.0f,1.0f);
+  return (int16_t)lroundf(n*1000.0f);
+}
+void calibrateJoystick() {
+  Serial.println("Leave joystick centered for calibration.");
+  delay(500);
+  long sx=0,sy=0;
+  for (int i=0;i<150;i++) { sx+=analogRead(JOY_X); sy+=analogRead(JOY_Y); delay(4); }
+  joyCenterX=sx/150; joyCenterY=sy/150;
+  Serial.printf("Joystick center: %d,%d\n",joyCenterX,joyCenterY);
+}
+bool startRadio() {
+  WiFi.mode(WIFI_STA); WiFi.disconnect(); delay(100);
+  if (esp_wifi_set_channel(ESPNOW_CHANNEL,WIFI_SECOND_CHAN_NONE)!=ESP_OK) return false;
+  if (esp_now_init()!=ESP_OK) return false;
+  esp_now_peer_info_t peer={};
+  memcpy(peer.peer_addr,BROADCAST_MAC,6);
+  peer.channel=ESPNOW_CHANNEL; peer.encrypt=false;
+  if (!esp_now_is_peer_exist(BROADCAST_MAC) &&
+      esp_now_add_peer(&peer)!=ESP_OK) return false;
+  Serial.print("Controller MAC: "); Serial.println(WiFi.macAddress());
+  return true;
+}
+const char *modeName() {
+  if (mode==MODE_TOUCHPAD) return "TOUCHPAD";
+  if (mode==MODE_JOYSTICK) return "JOYSTICK";
+  return "AIR MOUSE";
+}
+void updateDisplays(const ControllerPacket &p) {
+  if (lcdReady) {
+    lcd->fillScreen(BLACK); lcd->setTextColor(WHITE);
+    lcd->setTextSize(2); lcd->setCursor(8,8); lcd->println("Gravix Zyro");
+    lcd->setTextSize(1); lcd->setCursor(8,45); lcd->printf("By AirNex | %s",modeName());
+    lcd->setCursor(8,68); lcd->printf("Touch: %s",p.touchActive?"ACTIVE":"READY");
+    lcd->setCursor(8,87); lcd->printf("XY: %u,%u",p.touchX,p.touchY);
+    lcd->setCursor(8,106); lcd->printf("Joy: %d,%d",p.joyX,p.joyY);
+    lcd->setCursor(8,125); lcd->printf("IMU: %s (0x%02X)",imuReady?"OK":"FAIL",imuWhoAmI);
+    lcd->setCursor(8,144); lcd->printf("Radio: %s",radioReady?"OK":"FAIL");
+    lcd->setCursor(8,220); lcd->println("B1: Left click");
+    lcd->setCursor(8,236); lcd->println("B2: Right click");
+    lcd->setCursor(8,252); lcd->println("B3: Change mode");
+    lcd->setCursor(8,268); lcd->println("B4: Back");
+  }
+  if (oledReady) {
+    oled.clearDisplay(); oled.setTextColor(SSD1306_WHITE); oled.setTextSize(1);
+    oled.setCursor(0,0); oled.println("Gravix Zyro");
+    oled.print("Mode: "); oled.println(modeName());
+    oled.print("Touch: "); oled.println(p.touchActive?"ON":"OFF");
+    oled.print("Joy: "); oled.print(p.joyX); oled.print(","); oled.println(p.joyY);
+    oled.print("IMU: "); oled.println(imuReady?"OK":"FAIL");
+    oled.print("Radio: "); oled.println(radioReady?"OK":"FAIL");
+    oled.display();
   }
 }
-
-void onDataSent(const wifi_tx_info_t *info,
-                esp_now_send_status_t status) {
-  // Keep callback lightweight; avoid printing every packet.
-}
-
 void setup() {
-  Serial.begin(115200);
-
-  pinMode(BUTTON_B1, INPUT_PULLUP);
-  pinMode(BUTTON_B2, INPUT_PULLUP);
-  pinMode(BUTTON_B3, INPUT_PULLUP);
-  pinMode(BUTTON_B4, INPUT_PULLUP);
-
-  // ADC1 pins; joystick X -> GPIO34, Y -> GPIO35.
+  Serial.begin(115200); delay(500);
+  Serial.println("\nGravix Zyro by AirNex controller starting");
+  pinMode(BTN_LEFT,INPUT_PULLUP); pinMode(BTN_RIGHT,INPUT_PULLUP);
+  pinMode(BTN_MODE,INPUT_PULLUP); pinMode(BTN_BACK,INPUT_PULLUP);
+  pinMode(TOUCH_RST,OUTPUT); digitalWrite(TOUCH_RST,LOW); delay(5);
+  digitalWrite(TOUCH_RST,HIGH); delay(50); pinMode(TOUCH_INT,INPUT);
   analogReadResolution(12);
-
-  WiFi.mode(WIFI_STA);
-  WiFi.disconnect();
-
-  Serial.print("FrameMind Controller MAC: ");
-  Serial.println(WiFi.macAddress());
-
-  if (esp_now_init() != ESP_OK) {
-    Serial.println("ESP-NOW initialization failed.");
-    while (true) delay(1000);
-  }
-
-  esp_now_register_send_cb(onDataSent);
-
-  esp_now_peer_info_t peerInfo = {};
-  memcpy(peerInfo.peer_addr, receiverMAC, 6);
-  peerInfo.channel = 0; // Use the current Wi-Fi channel.
-  peerInfo.encrypt = false;
-
-  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
-    Serial.println("Failed to add receiver peer.");
-    while (true) delay(1000);
-  }
-
-  packet.mode = currentMode;
-  packet.dx = 0;
-  packet.dy = 0;
-  packet.events = 0;
-
-  Serial.println("FrameMind controller ready.");
-  Serial.println("B1=Click/Enter, B2=Right-click/Escape");
-  Serial.println("B3=Toggle mode, B4=Back/Escape");
+  analogSetPinAttenuation(JOY_X,ADC_11db); analogSetPinAttenuation(JOY_Y,ADC_11db);
+  Wire.begin(SDA_PIN,SCL_PIN,100000);
+  initImu();
+  oledReady=oled.begin(SSD1306_SWITCHCAPVCC,0x3C);
+  pinMode(LCD_BL,OUTPUT); digitalWrite(LCD_BL,HIGH);
+  lcdReady=lcd->begin(27000000);
+  if (lcdReady) { lcd->setRotation(0); lcd->fillScreen(BLACK); }
+  calibrateJoystick();
+  if (imuReady) calibrateGyroscope();
+  radioReady=startRadio();
+  Serial.println("Controller ready");
 }
-
 void loop() {
-  bool b1Event = false;
-  bool b2Event = false;
-  bool b3Event = false;
-  bool b4Event = false;
-
-  stablePressed(BUTTON_B1, previousB1, lastDebounceB1, b1Event);
-  stablePressed(BUTTON_B2, previousB2, lastDebounceB2, b2Event);
-  stablePressed(BUTTON_B3, previousB3, lastDebounceB3, b3Event);
-  stablePressed(BUTTON_B4, previousB4, lastDebounceB4, b4Event);
-
-  // B3 toggles the operating mode.
-  if (b3Event) {
-    currentMode = (currentMode == MOUSE_MODE)
-                    ? KEYBOARD_MODE
-                    : MOUSE_MODE;
-
-    Serial.print("Mode: ");
-    Serial.println(currentMode == MOUSE_MODE ? "MOUSE" : "KEYBOARD");
+  uint32_t nowUs=micros();
+  if ((uint32_t)(nowUs-lastSendUs)<10000) { delay(1); return; }
+  lastSendUs=nowUs;
+  uint8_t buttons=readButtons();
+  if ((buttons&(1<<2)) && !(previousButtons&(1<<2))) {
+    mode=(mode+1)%3; Serial.printf("Mode: %s\n",modeName());
   }
-
-  packet.mode = currentMode;
-  packet.events = 0;
-
-  if (b1Event) packet.events |= EVENT_B1;
-  if (b2Event) packet.events |= EVENT_B2;
-  if (b4Event) packet.events |= EVENT_B4;
-
-  // Joystick movement is active in Mouse mode only.
-  if (currentMode == MOUSE_MODE) {
-    int rawX = analogRead(JOYSTICK_X);
-    int rawY = analogRead(JOYSTICK_Y);
-
-    packet.dx = joystickAxis(rawX, false);
-    packet.dy = joystickAxis(rawY, true);
-  } else {
-    packet.dx = 0;
-    packet.dy = 0;
+  uint8_t gesture=0;
+  if (!readTouch(gesture)) touchActive=false;
+  uint8_t gestureEvent=0;
+  if (gesture==0) lastGesture=0;
+  else if (gesture!=lastGesture) { gestureEvent=gesture; lastGesture=gesture; }
+  int16_t jx=normalizeAxis(analogRead(JOY_X),joyCenterX);
+  int16_t jy=normalizeAxis(analogRead(JOY_Y),joyCenterY);
+  float gx=0,gy=0,gz=0;
+  if (imuReady) readGyroRad(gx,gy,gz);
+  ControllerPacket p={};
+  p.magic=0xC0DE; p.version=3; p.mode=mode; p.buttons=buttons;
+  p.touchActive=touchActive?1:0; p.gesture=gestureEvent;
+  p.touchX=touchX; p.touchY=touchY; p.joyX=jx; p.joyY=jy;
+  p.gyroX=(int16_t)constrain(lroundf(gx*1000),-32768,32767);
+  p.gyroY=(int16_t)constrain(lroundf(gy*1000),-32768,32767);
+  p.gyroZ=(int16_t)constrain(lroundf(gz*1000),-32768,32767);
+  p.sequence=++sequenceNo;
+  if (radioReady) esp_now_send(BROADCAST_MAC,(const uint8_t*)&p,sizeof(p));
+  uint32_t nowMs=millis();
+  if (nowMs-lastDisplayMs>=500) { lastDisplayMs=nowMs; updateDisplays(p); }
+  if (nowMs-lastDebugMs>=1000) {
+    lastDebugMs=nowMs;
+    Serial.printf("mode=%u touch=%u xy=%u,%u joy=%d,%d gyro=%d,%d,%d\n",
+      p.mode,p.touchActive,p.touchX,p.touchY,p.joyX,p.joyY,p.gyroX,p.gyroY,p.gyroZ);
   }
-
-  sendPacket();
-
-  // 100 packets/second target.
-  delay(10);
+  previousButtons=buttons;
 }
